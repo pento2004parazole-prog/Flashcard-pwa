@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flashcard Web App</title>
+    <!-- Load Tailwind CSS -->
+    <script>
+    // Placeholder variables to prevent Firebase errors on GitHub Pages
+    const __app_id = 'github-pages-test-app';
+    const __firebase_config = '{}';
+    const __initial_auth_token = '';
+</script>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- PWA MANIFEST LINK (NEW LINE 1) -->
+    <link rel="manifest" href="/flashcard_manifest.json">
+
+    <!-- PWA SERVICE WORKER REGISTRATION (NEW CODE BLOCK) -->
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                // Note: The path depends on your hosting setup. Using root '/' for GitHub Pages.
+                navigator.serviceWorker.register('/flashcard_service_worker.js')
+                    .then(registration => {
+                        console.log('Service Worker registered:', registration.scope);
+                    })
+                    .catch(error => {
+                        console.error('Service Worker registration failed:', error);
+                    });
+            });
+        }
+    </script>
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, query, updateDoc, arrayUnion, arrayRemove, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- GLOBAL VARIABLES (Provided by Canvas Environment) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // --- Global State and Service Instances ---
+        let app, db, auth;
+        let userId = null;
+        let folders = []; // Stores {id, name, cards: []}
+        let state = {
+            screen: 'folders', // 'folders', 'qa_create', 'qa_list', 'practice'
+            currentFolderId: null,
+            currentCardIndex: 0
+        };
+
+        // --- Firebase Initialization and Authentication ---
+        async function initializeFirebase() {
+            if (!firebaseConfig) {
+                console.error("Firebase config not found.");
+                document.getElementById('app').innerHTML = `<div class="p-8 text-center text-red-500">Firebase configuration missing.</div>`;
+                return;
+            }
+
+            try {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        console.log("Authenticated as:", userId);
+                        setupFolderListener();
+                    } else {
+                        console.log("No user signed in.");
+                        userId = 'anonymous'; // Fallback for anonymous or unauth state
+                    }
+                    renderApp(); // Initial render after auth
+                });
+            } catch (error) {
+                console.error("Firebase init/auth error:", error);
+                document.getElementById('app').innerHTML = `<div class="p-8 text-center text-red-500">Authentication Error: Check console.</div>`;
+            }
+        }
+
+        // --- Firestore Listeners ---
+
+        function getFoldersCollectionRef() {
+            if (!userId) return null;
+            return collection(db, `artifacts/${appId}/users/${userId}/folders`);
+        }
+
+        function setupFolderListener() {
+            const foldersRef = getFoldersCollectionRef();
+            if (!foldersRef) return;
+            
+            // Real-time listener for folders
+            onSnapshot(foldersRef, (snapshot) => {
+                folders = snapshot.docs.map(doc => {
+                    const data = doc.data();
+                    // Deserialize the cards array from the JSON string
+                    let cardList = [];
+                    try {
+                        cardList = JSON.parse(data.cards || '[]');
+                    } catch (e) {
+                        console.error("Failed to parse cards JSON:", e);
+                    }
+                    return {
+                        id: doc.id,
+                        name: data.name,
+                        cards: cardList
+                    };
+                });
+                folders.sort((a, b) => a.name.localeCompare(b.name));
+                renderApp();
+            }, (error) => {
+                console.error("Firestore listen error:", error);
+            });
+        }
+
+        // --- Navigation and State Management ---
+
+        function navigate(screen, folderId = null) {
+            state.screen = screen;
+            if (folderId !== null) {
+                state.currentFolderId = folderId;
+                state.currentCardIndex = 0; // Reset index when changing folders
+            }
+            renderApp();
+        }
+
+        // --- Helper Functions ---
+
+        function getFolderById(id) {
+            return folders.find(f => f.id === id);
+        }
+        
+        function getFolderByName(name) {
+            return folders.find(f => f.name === name);
+        }
+
+        function generateUniqueId() {
+             return 'f' + Date.now().toString(36) + Math.random().toString(36).substr(2);
+        }
+
+        function showToast(message, isError = false) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.classList.remove('hidden', 'bg-red-600', 'bg-green-600');
+            toast.classList.add(isError ? 'bg-red-600' : 'bg-green-600', 'opacity-100');
+            setTimeout(() => {
+                toast.classList.remove('opacity-100');
+                toast.classList.add('hidden');
+            }, isError ? 3000 : 1500);
+        }
+
+        // --- Firestore CRUD Operations ---
+
+        async function createOrRenameFolder(oldId, newName) {
+            if (!userId) return showToast("Authentication not ready.", true);
+            
+            newName = newName.trim();
+            if (!newName) return showToast("Folder name cannot be empty.", true);
+
+            const existingFolder = getFolderByName(newName);
+            if (existingFolder && existingFolder.id !== oldId) {
+                return showToast(`Folder '${newName}' already exists.`, true);
+            }
+
+            let folderRef;
+            const existingFolderData = getFolderById(oldId);
+            const cardsJson = existingFolderData ? JSON.stringify(existingFolderData.cards) : '[]';
+
+            if (oldId && existingFolderData) {
+                // Rename scenario
+                folderRef = doc(db, `artifacts/${appId}/users/${userId}/folders`, oldId);
+                await updateDoc(folderRef, { name: newName });
+                showToast(`Folder renamed to '${newName}'.`);
+            } else {
+                // Create new scenario
+                const newId = generateUniqueId();
+                folderRef = doc(db, `artifacts/${appId}/users/${userId}/folders`, newId);
+                await setDoc(folderRef, { name: newName, cards: cardsJson });
+                showToast(`Folder '${newName}' created.`);
+            }
+        }
+
+        async function saveCard(folderId, question, answer) {
+            if (!userId) return showToast("Authentication not ready.", true);
+            question = question.trim();
+            answer = answer.trim();
+
+            if (!question || !answer) {
+                return showToast("Please enter both Question and Answer.", true);
+            }
+
+            const folder = getFolderById(folderId);
+            if (!folder) return showToast("Folder not found.", true);
+
+            const newCard = { question, answer };
+            folder.cards.push(newCard); // Update the local array
+            
+            // Serialize and save the entire array back to Firestore
+            const folderRef = doc(db, `artifacts/${appId}/users/${userId}/folders`, folderId);
+            await updateDoc(folderRef, { cards: JSON.stringify(folder.cards) });
+            
+            showToast("Flashcard saved successfully!");
+            // Clear inputs is handled by the calling function
+        }
+
+        async function deleteCard(folderId, index) {
+            if (!userId) return showToast("Authentication not ready.", true);
+            const folder = getFolderById(folderId);
+            if (!folder) return showToast("Folder not found.", true);
+
+            folder.cards.splice(index, 1); // Remove from local array
+            
+            // Serialize and save the modified array back to Firestore
+            const folderRef = doc(db, `artifacts/${appId}/users/${userId}/folders`, folderId);
+            await updateDoc(folderRef, { cards: JSON.stringify(folder.cards) });
+            
+            showToast("Card deleted.");
+            navigate('qa_list', folderId); // Re-render the list
+        }
+
+        async function deleteFolder(folderId) {
+            if (!userId) return showToast("Authentication not ready.", true);
+            const folderRef = doc(db, `artifacts/${appId}/users/${userId}/folders`, folderId);
+            await deleteDoc(folderRef);
+            showToast("Folder deleted.");
+            navigate('folders');
+        }
+
+
+        // --- UI Components / Rendering Functions ---
+
+        function renderApp() {
+            const appDiv = document.getElementById('app');
+            appDiv.innerHTML = '';
+
+            if (userId === null) {
+                 appDiv.innerHTML = '<div class="flex items-center justify-center h-full"><div class="text-xl text-white">Loading App...</div></div>';
+                 return;
+            }
+
+            let content;
+            switch (state.screen) {
+                case 'folders':
+                    content = renderFolderScreen();
+                    break;
+                case 'qa_create':
+                    content = renderQACreateScreen();
+                    break;
+                case 'qa_list':
+                    content = renderQAListScreen();
+                    break;
+                case 'practice':
+                    content = renderPracticeScreen();
+                    break;
+                default:
+                    content = renderFolderScreen();
+            }
+            appDiv.appendChild(content);
+        }
+        
+        // --- Modals (Popups) ---
+
+        function renderRenameModal(folder) {
+            const isNew = !folder;
+            const oldName = folder ? folder.name : '';
+            const oldId = folder ? folder.id : null;
+            
+            const modal = document.createElement('div');
+            modal.id = 'modal';
+            modal.className = 'fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50';
+            
+            modal.innerHTML = `
+                <div class="bg-gray-800 p-6 rounded-lg shadow-2xl w-11/12 max-w-sm border border-gray-700">
+                    <h3 class="text-xl font-bold text-white mb-4">${isNew ? 'New Folder Name' : `Rename Folder: "${oldName}"`}</h3>
+                    <input id="renameInput" type="text" value="${oldName}" placeholder="Enter new folder name"
+                           class="w-full p-3 mb-4 bg-gray-900 text-white rounded-lg border border-gray-700 focus:outline-none focus:ring-2 focus:ring-green-500">
+                    <div class="flex justify-end space-x-3">
+                        ${!isNew ? `<button id="deleteBtn" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-semibold transition">Delete</button>` : ''}
+                        <button id="cancelBtn" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 font-semibold transition">Cancel</button>
+                        <button id="saveBtn" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 font-semibold transition">${isNew ? 'Create' : 'Rename'}</button>
+                    </div>
+                </div>
+            `;
+            
+            document.body.appendChild(modal);
+            const inputEl = document.getElementById('renameInput');
+            inputEl.focus();
+
+            const closeModal = () => document.body.removeChild(modal);
+            document.getElementById('cancelBtn').onclick = closeModal;
+            document.getElementById('saveBtn').onclick = async () => {
+                await createOrRenameFolder(oldId, inputEl.value);
+                closeModal();
+            };
+
+            if (!isNew) {
+                document.getElementById('deleteBtn').onclick = async () => {
+                    if (confirm("Are you sure you want to delete this folder and all its cards?")) {
+                         await deleteFolder(oldId);
+                         closeModal();
+                    }
+                };
+            }
+        }
+        
+        function renderConfirmDeleteCardModal(folderId, index, question) {
+            const modal = document.createElement('div');
+            modal.id = 'modal';
+            modal.className = 'fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50';
+            
+            modal.innerHTML = `
+                <div class="bg-gray-800 p-6 rounded-lg shadow-2xl w-11/12 max-w-sm border border-gray-700">
+                    <h3 class="text-xl font-bold text-red-400 mb-2">Confirm Deletion</h3>
+                    <p class="text-gray-300 mb-4">Are you sure you want to delete this card?</p>
+                    <p class="text-sm text-gray-400 italic mb-6 truncate">Q: ${question}</p>
+                    <div class="flex justify-end space-x-3">
+                        <button id="cancelBtn" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 font-semibold transition">Cancel</button>
+                        <button id="deleteBtn" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-semibold transition">Delete</button>
+                    </div>
+                </div>
+            `;
+            
+            document.body.appendChild(modal);
+
+            const closeModal = () => document.body.removeChild(modal);
+            document.getElementById('cancelBtn').onclick = closeModal;
+            document.getElementById('deleteBtn').onclick = async () => {
+                await deleteCard(folderId, index);
+                closeModal();
+            };
+        }
+
+
+        // --- FolderScreen ---
+
+        function renderFolderScreen() {
+            const folderEl = document.createElement('div');
+            folderEl.className = 'p-5 flex flex-col h-full space-y-4';
+            
+            const header = `<h1 class="text-3xl font-extrabold text-white pb-3 border-b border-gray-700">Flashcard Folders 🗂️</h1>`;
+            
+            const listItems = folders.map(f => `
+                <button data-id="${f.id}" data-name="${f.name}" 
+                        class="folder-btn w-full p-4 bg-gray-700 text-left text-xl text-white rounded-lg shadow-md hover:bg-gray-600 transition duration-150 active:scale-[0.98] transform">
+                    ${f.name} <span class="text-sm text-gray-400">(${f.cards.length} cards)</span>
+                </button>
+            `).join('');
+
+            folderEl.innerHTML = `
+                ${header}
+                <div class="flex-grow overflow-y-auto space-y-3">
+                    ${listItems || '<p class="text-center text-gray-400 pt-10">No folders yet! Click '+' below to create one.</p>'}
+                </div>
+                <div class="flex justify-end h-16">
+                    <button id="addFolderBtn" class="w-16 h-16 bg-green-600 text-white text-4xl rounded-full shadow-lg hover:bg-green-700 transition duration-150 active:scale-[0.9] transform">+</button>
+                </div>
+            `;
+            
+            // Event listeners
+            folderEl.querySelector('#addFolderBtn').onclick = () => renderRenameModal(null);
+            
+            folderEl.querySelectorAll('.folder-btn').forEach(btn => {
+                const folderId = btn.dataset.id;
+                
+                // Click to open
+                btn.onclick = () => navigate('qa_create', folderId);
+                
+                // Long press for rename/delete (using touch/mouse events)
+                let pressTimer;
+                
+                const startPress = () => {
+                    pressTimer = setTimeout(() => {
+                        renderRenameModal(getFolderById(folderId));
+                        pressTimer = null; // Clear timer flag after executing
+                    }, 700);
+                };
+
+                const cancelPress = () => {
+                    if (pressTimer) {
+                        clearTimeout(pressTimer);
+                        pressTimer = null;
+                    }
+                };
+
+                btn.addEventListener('mousedown', startPress);
+                btn.addEventListener('mouseup', cancelPress);
+                btn.addEventListener('mouseleave', cancelPress);
+                btn.addEventListener('touchstart', startPress, { passive: true });
+                btn.addEventListener('touchend', cancelPress);
+            });
+
+            return folderEl;
+        }
+
+        // --- QACreateScreen ---
+
+        function renderQACreateScreen() {
+            const folder = getFolderById(state.currentFolderId);
+            if (!folder) {
+                navigate('folders');
+                return document.createElement('div');
+            }
+
+            const createEl = document.createElement('div');
+            createEl.className = 'p-5 flex flex-col h-full space-y-4';
+
+            createEl.innerHTML = `
+                <div class="flex justify-between items-center h-14 pb-2 border-b border-gray-700">
+                    <h1 class="text-2xl font-bold text-white truncate">${folder.name}</h1>
+                    <button id="backBtn" class="px-4 py-1 bg-gray-600 text-white text-lg rounded-lg hover:bg-gray-700 transition">Back</button>
+                </div>
+                
+                <textarea id="questionInput" placeholder="Question (Type or Paste)"
+                          class="flex-grow p-4 bg-gray-900 text-white text-xl rounded-lg border border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                          style="min-height: 35%"></textarea>
+                
+                <textarea id="answerInput" placeholder="Answer"
+                          class="flex-grow p-4 bg-gray-900 text-white text-xl rounded-lg border border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                          style="min-height: 35%"></textarea>
+
+                <div class="flex justify-between space-x-3 h-16">
+                    <button id="saveBtn" class="flex-1 px-4 py-2 bg-green-600 text-white text-lg font-semibold rounded-lg hover:bg-green-700 transition">💾 Save Card</button>
+                    <button id="viewBtn" class="flex-1 px-4 py-2 bg-blue-600 text-white text-lg font-semibold rounded-lg hover:bg-blue-700 transition">📋 View All Cards</button>
+                    <button id="practiceBtn" class="flex-1 px-4 py-2 bg-purple-600 text-white text-lg font-semibold rounded-lg hover:bg-purple-700 transition">🧠 Practice</button>
+                </div>
+            `;
+
+            // Event listeners
+            createEl.querySelector('#backBtn').onclick = () => navigate('folders');
+            createEl.querySelector('#viewBtn').onclick = () => navigate('qa_list', folder.id);
+            createEl.querySelector('#practiceBtn').onclick = () => {
+                if (folder.cards.length > 0) {
+                    navigate('practice', folder.id);
+                } else {
+                    showToast("No cards in this folder to practice.", true);
+                }
+            };
+            
+            createEl.querySelector('#saveBtn').onclick = async () => {
+                const q = document.getElementById('questionInput').value;
+                const a = document.getElementById('answerInput').value;
+                await saveCard(folder.id, q, a);
+                // Clear inputs after save
+                document.getElementById('questionInput').value = '';
+                document.getElementById('answerInput').value = '';
+            };
+
+            return createEl;
+        }
+
+        // --- QAListScreen ---
+
+        function renderQAListScreen() {
+            const folder = getFolderById(state.currentFolderId);
+            if (!folder) {
+                navigate('folders');
+                return document.createElement('div');
+            }
+            
+            const listEl = document.createElement('div');
+            listEl.className = 'p-5 flex flex-col h-full space-y-4';
+
+            const header = `
+                <div class="flex justify-between items-center h-14 pb-2 border-b border-gray-700">
+                    <h1 class="text-2xl font-bold text-white truncate">${folder.name} List</h1>
+                    <button id="backBtn" class="px-4 py-1 bg-gray-600 text-white text-lg rounded-lg hover:bg-gray-700 transition">Back</button>
+                </div>
+            `;
+            
+            const listItems = folder.cards.map((card, index) => `
+                <button data-index="${index}" class="card-list-btn w-full p-3 bg-gray-700 text-left text-white text-base rounded-lg shadow-md hover:bg-gray-600 transition duration-150 truncate">
+                    Q${index + 1}: ${card.question}
+                </button>
+            `).join('');
+
+
+            listEl.innerHTML = `
+                ${header}
+                <div class="flex-grow overflow-y-auto space-y-2">
+                    ${listItems || '<p class="text-center text-gray-400 pt-10">No cards saved yet!</p>'}
+                </div>
+            `;
+            
+            listEl.querySelector('#backBtn').onclick = () => navigate('qa_create', folder.id);
+
+            listEl.querySelectorAll('.card-list-btn').forEach(btn => {
+                // Long press for delete
+                let pressTimer;
+                const index = parseInt(btn.dataset.index);
+                const question = folder.cards[index].question;
+
+                const startPress = () => {
+                    pressTimer = setTimeout(() => {
+                        renderConfirmDeleteCardModal(folder.id, index, question);
+                        pressTimer = null;
+                    }, 700);
+                };
+
+                const cancelPress = () => {
+                    if (pressTimer) {
+                        clearTimeout(pressTimer);
+                        pressTimer = null;
+                    }
+                };
+                
+                btn.addEventListener('mousedown', startPress);
+                btn.addEventListener('mouseup', cancelPress);
+                btn.addEventListener('mouseleave', cancelPress);
+                btn.addEventListener('touchstart', startPress, { passive: true });
+                btn.addEventListener('touchend', cancelPress);
+            });
+
+
+            return listEl;
+        }
+
+        // --- PracticeScreen ---
+
+        function renderPracticeScreen() {
+            const folder = getFolderById(state.currentFolderId);
+            if (!folder || folder.cards.length === 0) {
+                navigate('qa_create', state.currentFolderId);
+                return document.createElement('div');
+            }
+
+            const totalCards = folder.cards.length;
+            const card = folder.cards[state.currentCardIndex];
+            const isQuestion = state.currentCardIndex % 2 === 0; // Simple way to track Q/A state for rendering
+            
+            const practiceEl = document.createElement('div');
+            practiceEl.className = 'p-5 flex flex-col h-full space-y-4';
+
+            practiceEl.innerHTML = `
+                <div class="flex justify-between items-center h-14 pb-2 border-b border-gray-700">
+                    <h1 class="text-3xl font-bold text-white">${state.currentCardIndex + 1}/${totalCards}</h1>
+                    <button id="backBtn" class="px-4 py-1 bg-gray-600 text-white text-lg rounded-lg hover:bg-gray-700 transition">Back</button>
+                </div>
+                
+                <!-- Card Container for Flip/Swipe -->
+                <div id="cardContainer" class="flex-grow relative overflow-hidden">
+                    <button id="flashcard" class="absolute inset-0 bg-gray-900 text-white text-center rounded-2xl shadow-xl p-8 cursor-pointer active:shadow-inner transition duration-150 transform active:scale-[0.99] flex items-center justify-center">
+                        <p id="cardText" class="text-3xl font-extrabold max-w-full leading-snug">${isQuestion ? card.question : card.answer}</p>
+                    </button>
+                </div>
+            `;
+
+            practiceEl.querySelector('#backBtn').onclick = () => navigate('qa_create', folder.id);
+
+            const cardButton = practiceEl.querySelector('#flashcard');
+            const cardContainer = practiceEl.querySelector('#cardContainer');
+            
+            // --- Flip Logic ---
+            let isFlipped = false;
+            cardButton.onclick = () => {
+                const cardTextEl = document.getElementById('cardText');
+                
+                // Animate out (Y-axis flip effect)
+                cardButton.style.transition = 'transform 0.15s ease-in';
+                cardButton.style.transform = 'scaleY(0)';
+
+                setTimeout(() => {
+                    isFlipped = !isFlipped;
+                    cardTextEl.textContent = isFlipped ? card.answer : card.question;
+                    
+                    // Animate in
+                    cardButton.style.transition = 'transform 0.15s ease-out';
+                    cardButton.style.transform = 'scaleY(1)';
+                }, 150);
+            };
+
+            // --- Swipe Logic ---
+            let touchStartX = 0;
+            const SWIPE_THRESHOLD = 50;
+
+            const changeCard = (direction) => {
+                isFlipped = false;
+                let newIndex = state.currentCardIndex + direction;
+                
+                if (newIndex < 0) {
+                    newIndex = totalCards - 1;
+                } else if (newIndex >= totalCards) {
+                    newIndex = 0;
+                }
+                
+                state.currentCardIndex = newIndex;
+                renderApp();
+            };
+
+            cardContainer.addEventListener('touchstart', (e) => {
+                touchStartX = e.touches[0].clientX;
+            });
+
+            cardContainer.addEventListener('touchend', (e) => {
+                const touchEndX = e.changedTouches[0].clientX;
+                const diff = touchStartX - touchEndX; // positive for left swipe (Next), negative for right swipe (Prev)
+                
+                if (Math.abs(diff) > SWIPE_THRESHOLD) {
+                    if (diff > 0) {
+                        changeCard(1); // Swipe left (Next)
+                    } else {
+                        changeCard(-1); // Swipe right (Previous)
+                    }
+                }
+            });
+
+            // Ensure text is centered on initial render (Kivy update_card_text_size equivalent)
+            const cardTextEl = practiceEl.querySelector('#cardText');
+            cardTextEl.className = 'text-3xl font-extrabold max-w-[90%] leading-snug break-words'; // Limit width for centering/wrapping
+
+            return practiceEl;
+        }
+
+
+        // --- Main Execution ---
+
+        window.onload = initializeFirebase;
+
+    </script>
+    
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            height: 100vh;
+            background-color: #1f2937; /* Dark background */
+        }
+        #app {
+            height: 100vh;
+            width: 100vw;
+            max-width: 600px; /* Max width for mobile-centric app */
+            margin: 0 auto;
+            background-color: #1f2937; /* Gray-800 equivalent */
+        }
+        /* Style for the card text content */
+        #cardText {
+             /* Use max-width for wrapping/centering like Kivy's text_size logic */
+             max-width: 90%; 
+        }
+    </style>
+</head>
+<body class="bg-gray-900">
+    <!-- Main Application Container -->
+    <div id="app">
+        <div class="flex items-center justify-center h-full">
+            <div class="text-xl text-white">Loading App...</div>
+        </div>
+    </div>
+
+    <!-- Toast Notification Area -->
+    <div id="toast" class="fixed bottom-5 right-5 p-3 rounded-lg text-white font-semibold shadow-lg transition-opacity duration-300 hidden opacity-0 z-50">
+        Message
+    </div>
+</body>
+</html>
+
+
